@@ -7,11 +7,11 @@ from pathlib import Path
 from flask import Flask
 from threading import Thread
 
-# Persistent storage during runtime (temporary on Render)
-DATA_FILE = Path("/tmp/scores.json")
-INIT_FILE = Path("scores.json")  # File from repo (your old Replit scores)
+# === File Storage Setup ===
+DATA_FILE = Path("/tmp/scores.json")  # Temporary storage for free Render
+INIT_FILE = Path("scores.json")       # Initial file from repo (optional)
 
-# Initialize /tmp with existing scores.json from repo if available
+# Initialize /tmp with initial scores if available
 if not DATA_FILE.exists() and INIT_FILE.exists():
     DATA_FILE.write_text(INIT_FILE.read_text())
 
@@ -25,20 +25,21 @@ def save_scores(scores):
     with open(DATA_FILE, "w") as f:
         json.dump(scores, f, separators=(',', ':'))
 
-# Discord bot setup
+# === Discord Bot Setup ===
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"Bot is ready as {bot.user}")
+    print(f"[INFO] Bot is ready as {bot.user}")
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
+    # Detect Wordle messages (e.g., "Wordle 1,402 3/6")
     match = re.search(r"Wordle\s+([\d,]+)\s+(\d|X)/6", message.content)
     if match:
         wordle_number = match.group(1).replace(",", "")
@@ -60,12 +61,18 @@ async def on_message(message):
 
         save_scores(scores)
 
+        print(f"[LOG] Recorded Wordle #{wordle_number} for {message.author} ({tries} tries)")
+
         await message.channel.send(
             f"Recorded Wordle #{wordle_number} — {tries} tries for {message.author.display_name}!"
         )
 
-    # await bot.process_commands(message)
+    # Forward only commands (prefix !) to command processor to avoid duplicates
+    if message.content.startswith("!"):
+        print(f"[LOG] Processing command: {message.content}")
+        await bot.process_commands(message)
 
+# === Commands ===
 @bot.command(name="leaderboard")
 async def leaderboard(ctx):
     scores = load_scores()
@@ -80,15 +87,17 @@ async def leaderboard(ctx):
         leaderboard_lines.append(f"**{user.display_name}** — {data['total']} tries")
 
     leaderboard_text = "__**Wordle Leaderboard**__\n" + "\n".join(leaderboard_lines)
+    print("[LOG] Leaderboard requested")
     await ctx.send(leaderboard_text)
 
 @bot.command(name="resetweek")
 @commands.has_permissions(administrator=True)
 async def resetweek(ctx):
     save_scores({})
+    print("[LOG] Scores reset by admin command")
     await ctx.send("Scores have been reset for the new week!")
 
-# Minimal Flask server for Render Web Service health check
+# === Minimal Flask server for Render health check ===
 app = Flask(__name__)
 
 @app.route("/")
@@ -96,10 +105,10 @@ def home():
     return "OK"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=10000)  # Render assigns port 10000
+    app.run(host="0.0.0.0", port=10000)  # Required for Render web service health
 
 if __name__ == "__main__":
-    # Start Flask server
+    # Start Flask for Render health checks
     Thread(target=run_flask).start()
 
     # Start Discord bot
