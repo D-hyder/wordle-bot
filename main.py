@@ -64,7 +64,7 @@ async def on_message(message):
             f"Recorded Wordle #{wordle_number} — {tries} tries for {message.author.display_name}!"
         )
 
-    await bot.process_commands(message)
+    # await bot.process_commands(message)
 
 @bot.command(name="leaderboard")
 async def leaderboard(ctx):
