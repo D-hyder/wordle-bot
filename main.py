@@ -4,8 +4,10 @@ import re
 import json
 import os
 from pathlib import Path
+from flask import Flask
+from threading import Thread
 
-# Path for persistent storage on Render
+# Path for persistent storage
 DATA_DIR = Path("/var/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = DATA_DIR / "scores.json"
@@ -35,7 +37,6 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Detect Wordle message (e.g., "Wordle 1,402 3/6")
     match = re.search(r"Wordle\s+([\d,]+)\s+(\d|X)/6", message.content)
     if match:
         wordle_number = match.group(1).replace(",", "")
@@ -45,11 +46,9 @@ async def on_message(message):
         scores = load_scores()
         user_id = str(message.author.id)
 
-        # Initialize user if new
         if user_id not in scores:
             scores[user_id] = {"total": 0, "games": {}}
 
-        # Update total (subtract previous if overwriting)
         if wordle_number in scores[user_id]["games"]:
             prev_tries = scores[user_id]["games"][wordle_number]
             scores[user_id]["total"] -= prev_tries
@@ -87,8 +86,21 @@ async def resetweek(ctx):
     save_scores({})
     await ctx.send("Scores have been reset for the new week!")
 
-# Run bot
+# Minimal Flask server for Render Web Service health check
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "OK"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)  # Render assigns port 10000
+
 if __name__ == "__main__":
+    # Start Flask server
+    Thread(target=run_flask).start()
+
+    # Start Discord bot
     TOKEN = os.getenv("TOKEN")
     if not TOKEN:
         print("Error: TOKEN environment variable not set")
