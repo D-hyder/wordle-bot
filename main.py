@@ -7,11 +7,14 @@ from pathlib import Path
 from flask import Flask
 from threading import Thread
 
-# Path for persistent storage
-DATA_DIR = Path("/tmp")
-DATA_FILE = DATA_DIR / "scores.json"
+# Persistent storage during runtime (temporary on Render)
+DATA_FILE = Path("/tmp/scores.json")
+INIT_FILE = Path("scores.json")  # File from repo (your old Replit scores)
 
-# Load and save functions
+# Initialize /tmp with existing scores.json from repo if available
+if not DATA_FILE.exists() and INIT_FILE.exists():
+    DATA_FILE.write_text(INIT_FILE.read_text())
+
 def load_scores():
     if not DATA_FILE.exists():
         DATA_FILE.write_text("{}")
