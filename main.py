@@ -8,8 +8,7 @@ from flask import Flask
 from threading import Thread
 
 # Path for persistent storage
-DATA_DIR = Path("/var/data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path("/tmp")
 DATA_FILE = DATA_DIR / "scores.json"
 
 # Load and save functions
