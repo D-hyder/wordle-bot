@@ -1,7 +1,3 @@
-
-from flask import Flask
-import threading
-import os
 import discord
 from discord.ext import commands
 import re
@@ -9,13 +5,12 @@ import json
 import os
 from pathlib import Path
 
-# Intents
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Path for persistent storage on Render
+DATA_DIR = Path("/var/data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_FILE = DATA_DIR / "scores.json"
 
-DATA_FILE = Path("scores.json")
-
+# Load and save functions
 def load_scores():
     if not DATA_FILE.exists():
         DATA_FILE.write_text("{}")
@@ -23,9 +18,13 @@ def load_scores():
         return json.load(f)
 
 def save_scores(scores):
-    # Compact JSON to save memory
     with open(DATA_FILE, "w") as f:
         json.dump(scores, f, separators=(',', ':'))
+
+# Discord bot setup
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
@@ -36,10 +35,10 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Match Wordle format (supports commas in number)
+    # Detect Wordle message (e.g., "Wordle 1,402 3/6")
     match = re.search(r"Wordle\s+([\d,]+)\s+(\d|X)/6", message.content)
     if match:
-        wordle_number = match.group(1).replace(",", "")  # e.g. 1,402 → 1402
+        wordle_number = match.group(1).replace(",", "")
         tries = match.group(2)
         tries = 7 if tries == "X" else int(tries)
 
@@ -50,7 +49,7 @@ async def on_message(message):
         if user_id not in scores:
             scores[user_id] = {"total": 0, "games": {}}
 
-        # Update total (subtract previous score if overwriting same day)
+        # Update total (subtract previous if overwriting)
         if wordle_number in scores[user_id]["games"]:
             prev_tries = scores[user_id]["games"][wordle_number]
             scores[user_id]["total"] -= prev_tries
@@ -60,7 +59,9 @@ async def on_message(message):
 
         save_scores(scores)
 
-        await message.channel.send(f"Recorded Wordle #{wordle_number} — {tries} tries for {message.author.display_name}!")
+        await message.channel.send(
+            f"Recorded Wordle #{wordle_number} — {tries} tries for {message.author.display_name}!"
+        )
 
     await bot.process_commands(message)
 
@@ -86,32 +87,10 @@ async def resetweek(ctx):
     save_scores({})
     await ctx.send("Scores have been reset for the new week!")
 
-# Flask app setup (minimal for health checks only)
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "OK"
-
-@app.route('/health')
-def health():
-    return "UP"
-
-def run_flask():
-    # Minimal Flask server - only for health checks
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
-
+# Run bot
 if __name__ == "__main__":
-    # Start Flask in a separate thread
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    
-    # Start Discord bot (requires TOKEN environment variable)
-    discord_token = os.getenv('TOKEN')
-    if discord_token:
-        bot.run(discord_token)
+    TOKEN = os.getenv("TOKEN")
+    if not TOKEN:
+        print("Error: TOKEN environment variable not set")
     else:
-        print("Please set TOKEN environment variable")
-        # Run just Flask if no Discord token
-        run_flask()
+        bot.run(TOKEN)
