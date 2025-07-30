@@ -76,8 +76,7 @@ async def on_message(message):
     if message.content.startswith("!"):
         await bot.process_commands(message)
 
-# === Commands ===
-
+# === Leaderboard Command ===
 @bot.command(name="leaderboard")
 async def leaderboard(ctx):
     scores = load_scores()
@@ -92,12 +91,16 @@ async def leaderboard(ctx):
     leaderboard_lines = []
     for user_id, data in sorted_scores:
         user = await bot.fetch_user(int(user_id))
-        leaderboard_lines.append(f"**{user.display_name}** — {data['total']} tries")
+        games_played = len(data["games"])
+        leaderboard_lines.append(
+            f"**{user.display_name}** — {data['total']} tries ({games_played} games)"
+        )
 
     leaderboard_text = "__**Wordle Leaderboard**__\n" + "\n".join(leaderboard_lines)
     print("[LOG] Leaderboard requested")
     await ctx.send(leaderboard_text)
 
+# === Reset Week Command ===
 @bot.command(name="resetweek")
 @commands.has_permissions(administrator=True)
 async def resetweek(ctx):
@@ -108,7 +111,6 @@ async def resetweek(ctx):
     await ctx.send("Scores have been reset for the new week!")
 
 # === Daily Players Opt-In/Out ===
-
 @bot.command(name="joinwordle")
 async def joinwordle(ctx):
     scores = load_scores()
@@ -212,13 +214,24 @@ async def pingmissing(ctx):
 
     message_parts = []
     for wordle_num in reversed(track_numbers):  # Show older first
+        # Check how many have submitted this Wordle
+        submitted_players = [
+            uid for uid in scores["players"]
+            if uid in scores and str(wordle_num) in scores[uid].get("games", {})
+        ]
+
+        # Only ping if 2 or more players have submitted
+        if len(submitted_players) < 2:
+            continue
+
+        # Missing players for this Wordle
         missing_users = get_missing_for(scores, wordle_num)
         if missing_users:
             mentions = ", ".join(f"<@{uid}>" for uid in missing_users)
             message_parts.append(f"Missing Wordle #{wordle_num}: {mentions}")
 
     if not message_parts:
-        await ctx.send("Everyone has submitted the last two Wordles!")
+        await ctx.send("No one to ping (either no scores yet or fewer than 2 submissions).")
     else:
         await ctx.send("\n".join(message_parts))
 
