@@ -148,8 +148,14 @@ async def players(ctx):
 
     await ctx.send("**Daily Wordle Players:**\n" + ", ".join(names))
 
-# === Missing Command ===
+# === Helper: Get missing users for given Wordle number ===
+def get_missing_for(scores, wordle_num):
+    return [
+        user_id for user_id in scores["players"]
+        if user_id not in scores or str(wordle_num) not in scores[user_id]["games"]
+    ]
 
+# === Missing Command (non-ping) ===
 @bot.command(name="missing")
 async def missing(ctx):
     scores = load_scores()
@@ -157,31 +163,66 @@ async def missing(ctx):
         await ctx.send("No daily players have joined yet.")
         return
 
-    # Get latest Wordle number
-    latest_wordle = max(
-        (int(num) for user_data in scores.values() if isinstance(user_data, dict) and "games" in user_data
-         for num in user_data["games"].keys()),
-        default=None
-    )
+    # Get two most recent Wordle numbers
+    all_numbers = sorted({
+        int(num) for user_data in scores.values()
+        if isinstance(user_data, dict) and "games" in user_data
+        for num in user_data["games"].keys()
+    }, reverse=True)
 
-    if latest_wordle is None:
+    if not all_numbers:
         await ctx.send("No Wordle numbers found.")
         return
 
-    # Check which opted-in players are missing
-    missing_users = []
-    for user_id in scores["players"]:
-        if user_id not in scores or str(latest_wordle) not in scores[user_id]["games"]:
-            user = await bot.fetch_user(int(user_id))
-            missing_users.append(user.display_name)
+    track_numbers = all_numbers[:2]  # Max 2 puzzles
 
-    if not missing_users:
-        await ctx.send(f"All daily players submitted Wordle #{latest_wordle}!")
+    message_parts = []
+    for wordle_num in reversed(track_numbers):  # Show older first
+        missing_users = get_missing_for(scores, wordle_num)
+        if missing_users:
+            names = ", ".join([ (await bot.fetch_user(int(uid))).display_name for uid in missing_users ])
+            message_parts.append(f"Missing Wordle #{wordle_num}: {names}")
+
+    if not message_parts:
+        await ctx.send("Everyone has submitted the last two Wordles!")
     else:
-        await ctx.send(f"Missing Wordle #{latest_wordle}: {', '.join(missing_users)}")
+        await ctx.send("\n".join(message_parts))
+
+# === PingMissing Command (ping version) ===
+@bot.command(name="pingmissing")
+@commands.has_permissions(administrator=True)
+async def pingmissing(ctx):
+    scores = load_scores()
+    if not scores or "players" not in scores or not scores["players"]:
+        await ctx.send("No daily players have joined yet.")
+        return
+
+    # Get two most recent Wordle numbers
+    all_numbers = sorted({
+        int(num) for user_data in scores.values()
+        if isinstance(user_data, dict) and "games" in user_data
+        for num in user_data["games"].keys()
+    }, reverse=True)
+
+    if not all_numbers:
+        await ctx.send("No Wordle numbers found.")
+        return
+
+    track_numbers = all_numbers[:2]  # Max 2 puzzles
+
+    message_parts = []
+    for wordle_num in reversed(track_numbers):  # Show older first
+        missing_users = get_missing_for(scores, wordle_num)
+        if missing_users:
+            mentions = ", ".join(f"<@{uid}>" for uid in missing_users)
+            message_parts.append(f"Missing Wordle #{wordle_num}: {mentions}")
+
+    if not message_parts:
+        await ctx.send("Everyone has submitted the last two Wordles!")
+    else:
+        await ctx.send("\n".join(message_parts))
 
 # === Backup Command ===
-
 @bot.command(name="backup")
 @commands.has_permissions(administrator=True)
 async def backup(ctx):
@@ -196,7 +237,6 @@ async def backup(ctx):
     )
 
 # === Flask Health Check for Render ===
-
 app = Flask(__name__)
 
 @app.route("/")
