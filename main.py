@@ -8,8 +8,8 @@ from flask import Flask
 from threading import Thread
 
 # === File Storage Setup ===
-DATA_FILE = Path("/tmp/scores.json")  # Temporary storage for free Render
-INIT_FILE = Path("scores.json")       # Initial file from repo (optional)
+DATA_FILE = Path("/tmp/scores.json")  # Temporary storage on Render
+INIT_FILE = Path("scores.json")       # Initial file (optional from repo)
 
 # Initialize /tmp with initial scores if available
 if not DATA_FILE.exists() and INIT_FILE.exists():
@@ -39,7 +39,7 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Detect Wordle messages (e.g., "Wordle 1,402 3/6")
+    # Detect Wordle message (e.g., "Wordle 1,402 3/6")
     match = re.search(r"Wordle\s+([\d,]+)\s+(\d|X)/6", message.content)
     if match:
         wordle_number = match.group(1).replace(",", "")
@@ -52,6 +52,11 @@ async def on_message(message):
         if user_id not in scores:
             scores[user_id] = {"total": 0, "games": {}}
 
+        # Initialize daily players list if missing
+        if "players" not in scores:
+            scores["players"] = []
+
+        # Update tries for this Wordle
         if wordle_number in scores[user_id]["games"]:
             prev_tries = scores[user_id]["games"][wordle_number]
             scores[user_id]["total"] -= prev_tries
@@ -67,12 +72,12 @@ async def on_message(message):
             f"Recorded Wordle #{wordle_number} — {tries} tries for {message.author.display_name}!"
         )
 
-    # Forward only commands (prefix !) to command processor to avoid duplicates
+    # Only process commands if they start with prefix to avoid duplicates
     if message.content.startswith("!"):
-        print(f"[LOG] Processing command: {message.content}")
         await bot.process_commands(message)
 
 # === Commands ===
+
 @bot.command(name="leaderboard")
 async def leaderboard(ctx):
     scores = load_scores()
@@ -80,7 +85,10 @@ async def leaderboard(ctx):
         await ctx.send("No scores yet.")
         return
 
-    sorted_scores = sorted(scores.items(), key=lambda x: x[1]["total"])
+    # Filter out the "players" list from scoring data
+    player_scores = {k: v for k, v in scores.items() if k != "players"}
+
+    sorted_scores = sorted(player_scores.items(), key=lambda x: x[1]["total"])
     leaderboard_lines = []
     for user_id, data in sorted_scores:
         user = await bot.fetch_user(int(user_id))
@@ -93,11 +101,102 @@ async def leaderboard(ctx):
 @bot.command(name="resetweek")
 @commands.has_permissions(administrator=True)
 async def resetweek(ctx):
-    save_scores({})
+    scores = load_scores()
+    scores = {"players": scores.get("players", [])}  # Keep players list, reset scores
+    save_scores(scores)
     print("[LOG] Scores reset by admin command")
     await ctx.send("Scores have been reset for the new week!")
 
-# === Minimal Flask server for Render health check ===
+# === Daily Players Opt-In/Out ===
+
+@bot.command(name="joinwordle")
+async def joinwordle(ctx):
+    scores = load_scores()
+    if "players" not in scores:
+        scores["players"] = []
+    user_id = str(ctx.author.id)
+
+    if user_id not in scores["players"]:
+        scores["players"].append(user_id)
+        save_scores(scores)
+        await ctx.send(f"{ctx.author.display_name} joined daily Wordle tracking!")
+    else:
+        await ctx.send(f"{ctx.author.display_name}, you're already in the daily list!")
+
+@bot.command(name="leavewordle")
+async def leavewordle(ctx):
+    scores = load_scores()
+    if "players" in scores and str(ctx.author.id) in scores["players"]:
+        scores["players"].remove(str(ctx.author.id))
+        save_scores(scores)
+        await ctx.send(f"{ctx.author.display_name} left daily Wordle tracking.")
+    else:
+        await ctx.send(f"{ctx.author.display_name}, you weren't in the daily list.")
+
+@bot.command(name="players")
+async def players(ctx):
+    scores = load_scores()
+    if "players" not in scores or not scores["players"]:
+        await ctx.send("No daily players have joined yet.")
+        return
+
+    # Fetch display names of all opted-in players
+    names = []
+    for user_id in scores["players"]:
+        user = await bot.fetch_user(int(user_id))
+        names.append(user.display_name)
+
+    await ctx.send("**Daily Wordle Players:**\n" + ", ".join(names))
+
+# === Missing Command ===
+
+@bot.command(name="missing")
+async def missing(ctx):
+    scores = load_scores()
+    if not scores or "players" not in scores or not scores["players"]:
+        await ctx.send("No daily players have joined yet.")
+        return
+
+    # Get latest Wordle number
+    latest_wordle = max(
+        (int(num) for user_data in scores.values() if isinstance(user_data, dict) and "games" in user_data
+         for num in user_data["games"].keys()),
+        default=None
+    )
+
+    if latest_wordle is None:
+        await ctx.send("No Wordle numbers found.")
+        return
+
+    # Check which opted-in players are missing
+    missing_users = []
+    for user_id in scores["players"]:
+        if user_id not in scores or str(latest_wordle) not in scores[user_id]["games"]:
+            user = await bot.fetch_user(int(user_id))
+            missing_users.append(user.display_name)
+
+    if not missing_users:
+        await ctx.send(f"All daily players submitted Wordle #{latest_wordle}!")
+    else:
+        await ctx.send(f"Missing Wordle #{latest_wordle}: {', '.join(missing_users)}")
+
+# === Backup Command ===
+
+@bot.command(name="backup")
+@commands.has_permissions(administrator=True)
+async def backup(ctx):
+    # Send current scores.json file as attachment
+    if not DATA_FILE.exists():
+        await ctx.send("No scores file found.")
+        return
+
+    await ctx.send(
+        "Here is the current scores backup file:",
+        file=discord.File(str(DATA_FILE), filename="scores.json")
+    )
+
+# === Flask Health Check for Render ===
+
 app = Flask(__name__)
 
 @app.route("/")
@@ -105,13 +204,10 @@ def home():
     return "OK"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=10000)  # Required for Render web service health
+    app.run(host="0.0.0.0", port=10000)  # Render health check port
 
 if __name__ == "__main__":
-    # Start Flask for Render health checks
     Thread(target=run_flask).start()
-
-    # Start Discord bot
     TOKEN = os.getenv("TOKEN")
     if not TOKEN:
         print("Error: TOKEN environment variable not set")
