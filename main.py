@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from flask import Flask
 from threading import Thread
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
 
 # === File Storage Setup ===
 DATA_FILE = Path("/tmp/scores.json")  # Temporary storage on Render
@@ -50,7 +52,7 @@ async def on_message(message):
         user_id = str(message.author.id)
 
         if user_id not in scores:
-            scores[user_id] = {"total": 0, "games": {}}
+            scores[user_id] = {"total": 0, "games": {}, "wins": 0}
 
         # Initialize daily players list if missing
         if "players" not in scores:
@@ -100,13 +102,64 @@ async def leaderboard(ctx):
     print("[LOG] Leaderboard requested")
     await ctx.send(leaderboard_text)
 
-# === Reset Week Command ===
+# === Wins Command ===
+@bot.command(name="wins")
+async def wins(ctx):
+    scores = load_scores()
+    if not scores or "players" not in scores or not scores["players"]:
+        await ctx.send("No wins recorded yet.")
+        return
+
+    wins_lines = []
+    for user_id in scores["players"]:
+        if user_id in scores:
+            wins_count = scores[user_id].get("wins", 0)
+            user = await bot.fetch_user(int(user_id))
+            wins_lines.append(f"**{user.display_name}** — {wins_count} wins")
+
+    if not wins_lines:
+        await ctx.send("No wins recorded yet.")
+        return
+
+    wins_text = "__**Weekly Wins**__\n" + "\n".join(wins_lines)
+    await ctx.send(wins_text)
+
+# === Reset Week Command (congrats + wins tracking) ===
 @bot.command(name="resetweek")
 @commands.has_permissions(administrator=True)
 async def resetweek(ctx):
     scores = load_scores()
-    scores = {"players": scores.get("players", [])}  # Keep players list, reset scores
-    save_scores(scores)
+
+    # Find winner (least total tries)
+    player_scores = {k: v for k, v in scores.items() if k != "players"}
+    if player_scores:
+        winner_id, winner_data = min(player_scores.items(), key=lambda x: x[1]["total"])
+
+        # Initialize wins field if missing
+        if "wins" not in winner_data:
+            winner_data["wins"] = 0
+
+        # Increment weekly wins
+        winner_data["wins"] += 1
+        scores[winner_id] = winner_data
+        save_scores(scores)
+
+        # Announce winner
+        winner_user = await bot.fetch_user(int(winner_id))
+        await ctx.send(
+            f"🎉 Congratulations {winner_user.display_name}! "
+            f"You had the fewest tries this week with {winner_data['total']} tries! "
+            f"(Total weekly wins: {winner_data['wins']})"
+        )
+
+    # Reset scores but keep players and wins
+    new_scores = {"players": scores.get("players", [])}
+    for user_id, data in scores.items():
+        if user_id == "players":
+            continue
+        new_scores[user_id] = {"total": 0, "games": {}, "wins": data.get("wins", 0)}
+
+    save_scores(new_scores)
     print("[LOG] Scores reset by admin command")
     await ctx.send("Scores have been reset for the new week!")
 
@@ -120,6 +173,8 @@ async def joinwordle(ctx):
 
     if user_id not in scores["players"]:
         scores["players"].append(user_id)
+        if user_id not in scores:
+            scores[user_id] = {"total": 0, "games": {}, "wins": 0}
         save_scores(scores)
         await ctx.send(f"{ctx.author.display_name} joined daily Wordle tracking!")
     else:
@@ -248,6 +303,43 @@ async def backup(ctx):
         "Here is the current scores backup file:",
         file=discord.File(str(DATA_FILE), filename="scores.json")
     )
+
+# === Daily Penalty Function (Midnight CST) ===
+def penalize_missing():
+    scores = load_scores()
+
+    if "players" not in scores or not scores["players"]:
+        return
+
+    # Get two most recent Wordle numbers
+    all_numbers = sorted({
+        int(num) for user_data in scores.values()
+        if isinstance(user_data, dict) and "games" in user_data
+        for num in user_data["games"].keys()
+    }, reverse=True)
+
+    if not all_numbers:
+        return
+
+    track_numbers = all_numbers[:2]  # Max 2 puzzles
+
+    # Add penalty (7 tries) for missing players
+    for wordle_num in track_numbers:
+        for user_id in scores["players"]:
+            if user_id in scores and str(wordle_num) in scores[user_id].get("games", {}):
+                continue
+            if user_id not in scores:
+                scores[user_id] = {"total": 0, "games": {}, "wins": 0}
+            scores[user_id]["games"][str(wordle_num)] = 7
+            scores[user_id]["total"] += 7
+            print(f"[PENALTY] Added 7 tries for user {user_id} on Wordle #{wordle_num}")
+
+    save_scores(scores)
+
+# === Scheduler for Midnight Penalty ===
+scheduler = BackgroundScheduler(timezone=pytz.timezone("US/Central"))
+scheduler.add_job(penalize_missing, 'cron', hour=0, minute=0)
+scheduler.start()
 
 # === Flask Health Check for Render ===
 app = Flask(__name__)
