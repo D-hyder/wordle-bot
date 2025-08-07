@@ -1,22 +1,32 @@
 import discord
 from discord.ext import commands
+from discord.ext import tasks
 import re
 import json
 import os
 from pathlib import Path
 from flask import Flask
 from threading import Thread
-from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
 import pytz
 
-# === File Storage Setup ===
-DATA_FILE = Path("/tmp/scores.json")  # Temporary storage on Render
-INIT_FILE = Path("scores.json")       # Initial file (optional from repo)
+# === File Paths ===
+DATA_FILE = Path("/tmp/scores.json")
+INIT_FILE = Path("scores.json")
 
-# Initialize /tmp with initial scores if available
 if not DATA_FILE.exists() and INIT_FILE.exists():
     DATA_FILE.write_text(INIT_FILE.read_text())
 
+# === Constants ===
+CENTRAL_TZ = pytz.timezone("America/Chicago")
+WORDLE_START_DATE = datetime(2021, 6, 19)
+
+# === Bot Setup ===
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# === Load/Save Functions ===
 def load_scores():
     if not DATA_FILE.exists():
         DATA_FILE.write_text("{}")
@@ -27,334 +37,156 @@ def save_scores(scores):
     with open(DATA_FILE, "w") as f:
         json.dump(scores, f, separators=(',', ':'))
 
-# === Discord Bot Setup ===
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+# === Wordle Helper ===
+# Anchor (efficient reference)
+anchor_wordle_number = 1509
+anchor_date = date(2025, 8, 6)
 
+# Wordle number to date
+def wordle_to_date(wordle_num):
+    delta = wordle_num - anchor_wordle_number
+    return anchor_date + timedelta(days=delta)
+
+# Date to Wordle number
+def date_to_wordle(some_date):
+    delta = (some_date - anchor_date).days
+    return anchor_wordle_number + delta
+  
+# === Scheduler ===
+@tasks.loop(minutes=1)
+async def daily_penalty_check():
+    now = datetime.now(CENTRAL_TZ)
+    if now.hour == 0 and now.minute == 1:  # 12:01 AM CST
+        scores = load_scores()
+        yesterday = now.date() - timedelta(days=1)
+        wordle_num = get_wordle_number_for_date(yesterday)
+
+        joined_users = {uid for uid in scores if "joined" in scores[uid] and scores[uid]["joined"]}
+        penalized = []
+
+        for uid in joined_users:
+            if wordle_num not in scores[uid]["games"]:
+                scores[uid]["games"][wordle_num] = 7
+                scores[uid]["total"] += 7
+                penalized.append(uid)
+
+        if penalized:
+            channel = discord.utils.get(bot.get_all_channels(), name="general")
+            if channel:
+                mentions = ", ".join(f"<@{uid}>" for uid in penalized)
+                await channel.send(f"⏰ Auto-penalty: {mentions} were given 7 tries for missing Wordle #{wordle_num}.")
+        save_scores(scores)
+
+# === Bot Events ===
 @bot.event
 async def on_ready():
-    print(f"[INFO] Bot is ready as {bot.user}")
+    print(f"Bot is ready as {bot.user}")
+    daily_penalty_check.start()
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # Detect Wordle message (e.g., "Wordle 1,402 3/6")
     match = re.search(r"Wordle\s+([\d,]+)\s+(\d|X)/6", message.content)
     if match:
         wordle_number = match.group(1).replace(",", "")
-        tries = match.group(2)
-        tries = 7 if tries == "X" else int(tries)
-
-        scores = load_scores()
+        tries = 7 if match.group(2) == "X" else int(match.group(2))
         user_id = str(message.author.id)
 
+        scores = load_scores()
         if user_id not in scores:
-            scores[user_id] = {"total": 0, "games": {}, "wins": 0}
+            scores[user_id] = {"total": 0, "games": {}, "joined": True, "wins": 0}
 
-        # Initialize daily players list if missing
-        if "players" not in scores:
-            scores["players"] = []
-
-        # Update tries for this Wordle
         if wordle_number in scores[user_id]["games"]:
-            prev_tries = scores[user_id]["games"][wordle_number]
-            scores[user_id]["total"] -= prev_tries
+            scores[user_id]["total"] -= scores[user_id]["games"][wordle_number]
 
         scores[user_id]["games"][wordle_number] = tries
         scores[user_id]["total"] += tries
 
         save_scores(scores)
+        await message.channel.send(f"✅ Wordle #{wordle_number} recorded — {tries} tries for {message.author.display_name}!")
 
-        print(f"[LOG] Recorded Wordle #{wordle_number} for {message.author} ({tries} tries)")
+    await bot.process_commands(message)
 
-        await message.channel.send(
-            f"Recorded Wordle #{wordle_number} — {tries} tries for {message.author.display_name}!"
-        )
-
-    # Only process commands if they start with prefix to avoid duplicates
-    if message.content.startswith("!"):
-        await bot.process_commands(message)
-
-# === Leaderboard Command ===
-@bot.command(name="leaderboard")
+# === Commands ===
+@bot.command()
 async def leaderboard(ctx):
     scores = load_scores()
     if not scores:
         await ctx.send("No scores yet.")
         return
+    sorted_scores = sorted(scores.items(), key=lambda x: x[1]["total"])
+    lines = [
+        f"**{await bot.fetch_user(int(uid))}** — {data['total']} tries over {len(data['games'])} games"
+        for uid, data in sorted_scores
+    ]
+    await ctx.send("__**🏆 Wordle Leaderboard**__\n" + "\n".join(lines))
 
-    # Filter out the "players" list from scoring data
-    player_scores = {k: v for k, v in scores.items() if k != "players"}
-
-    sorted_scores = sorted(player_scores.items(), key=lambda x: x[1]["total"])
-    leaderboard_lines = []
-    for user_id, data in sorted_scores:
-        user = await bot.fetch_user(int(user_id))
-        games_played = len(data["games"])
-        leaderboard_lines.append(
-            f"**{user.display_name}** — {data['total']} tries ({games_played} games)"
-        )
-
-    leaderboard_text = "__**Wordle Leaderboard**__\n" + "\n".join(leaderboard_lines)
-    print("[LOG] Leaderboard requested")
-    await ctx.send(leaderboard_text)
-
-# === Wins Command ===
-@bot.command(name="wins")
-async def wins(ctx):
+@bot.command()
+async def joinwordle(ctx):
     scores = load_scores()
-    if not scores or "players" not in scores or not scores["players"]:
-        await ctx.send("No wins recorded yet.")
-        return
+    uid = str(ctx.author.id)
+    if uid not in scores:
+        scores[uid] = {"total": 0, "games": {}, "joined": True, "wins": 0}
+    else:
+        scores[uid]["joined"] = True
+    save_scores(scores)
+    await ctx.send(f"{ctx.author.mention} joined the daily Wordle challenge!")
 
-    wins_lines = []
-    for user_id in scores["players"]:
-        if user_id in scores:
-            wins_count = scores[user_id].get("wins", 0)
-            user = await bot.fetch_user(int(user_id))
-            wins_lines.append(f"**{user.display_name}** — {wins_count} wins")
+@bot.command()
+async def leavewordle(ctx):
+    scores = load_scores()
+    uid = str(ctx.author.id)
+    if uid in scores:
+        scores[uid]["joined"] = False
+        save_scores(scores)
+        await ctx.send(f"{ctx.author.mention} left the daily Wordle challenge.")
 
-    if not wins_lines:
-        await ctx.send("No wins recorded yet.")
-        return
-
-    wins_text = "__**Weekly Wins**__\n" + "\n".join(wins_lines)
-    await ctx.send(wins_text)
-
-# === Reset Week Command (congrats + wins tracking) ===
-@bot.command(name="resetweek")
+@bot.command()
 @commands.has_permissions(administrator=True)
 async def resetweek(ctx):
     scores = load_scores()
+    winner = min((
+        (uid, data["total"]) for uid, data in scores.items() if data["games"]
+    ), key=lambda x: x[1], default=(None, None))
 
-    # Find winner (least total tries)
-    player_scores = {k: v for k, v in scores.items() if k != "players"}
-    if player_scores:
-        winner_id, winner_data = min(player_scores.items(), key=lambda x: x[1]["total"])
+    if winner[0]:
+        scores[winner[0]]["wins"] = scores[winner[0]].get("wins", 0) + 1
+        winner_name = (await bot.fetch_user(int(winner[0]))).display_name
+        await ctx.send(f"🎉 Congrats {winner_name} for winning the week with {winner[1]} total tries!")
 
-        # Initialize wins field if missing
-        if "wins" not in winner_data:
-            winner_data["wins"] = 0
-
-        # Increment weekly wins
-        winner_data["wins"] += 1
-        scores[winner_id] = winner_data
-        save_scores(scores)
-
-        # Announce winner
-        winner_user = await bot.fetch_user(int(winner_id))
-        await ctx.send(
-            f"🎉 Congratulations {winner_user.display_name}! "
-            f"You had the fewest tries this week with {winner_data['total']} tries! "
-            f"(Total weekly wins: {winner_data['wins']})"
-        )
-
-    # Reset scores but keep players and wins
-    new_scores = {"players": scores.get("players", [])}
-    for user_id, data in scores.items():
-        if user_id == "players":
-            continue
-        new_scores[user_id] = {"total": 0, "games": {}, "wins": data.get("wins", 0)}
-
-    save_scores(new_scores)
-    print("[LOG] Scores reset by admin command")
-    await ctx.send("Scores have been reset for the new week!")
-
-# === Daily Players Opt-In/Out ===
-@bot.command(name="joinwordle")
-async def joinwordle(ctx):
-    scores = load_scores()
-    if "players" not in scores:
-        scores["players"] = []
-    user_id = str(ctx.author.id)
-
-    if user_id not in scores["players"]:
-        scores["players"].append(user_id)
-        if user_id not in scores:
-            scores[user_id] = {"total": 0, "games": {}, "wins": 0}
-        save_scores(scores)
-        await ctx.send(f"{ctx.author.display_name} joined daily Wordle tracking!")
-    else:
-        await ctx.send(f"{ctx.author.display_name}, you're already in the daily list!")
-
-@bot.command(name="leavewordle")
-async def leavewordle(ctx):
-    scores = load_scores()
-    if "players" in scores and str(ctx.author.id) in scores["players"]:
-        scores["players"].remove(str(ctx.author.id))
-        save_scores(scores)
-        await ctx.send(f"{ctx.author.display_name} left daily Wordle tracking.")
-    else:
-        await ctx.send(f"{ctx.author.display_name}, you weren't in the daily list.")
-
-@bot.command(name="players")
-async def players(ctx):
-    scores = load_scores()
-    if "players" not in scores or not scores["players"]:
-        await ctx.send("No daily players have joined yet.")
-        return
-
-    # Fetch display names of all opted-in players
-    names = []
-    for user_id in scores["players"]:
-        user = await bot.fetch_user(int(user_id))
-        names.append(user.display_name)
-
-    await ctx.send("**Daily Wordle Players:**\n" + ", ".join(names))
-
-# === Helper: Get missing users for given Wordle number ===
-def get_missing_for(scores, wordle_num):
-    return [
-        user_id for user_id in scores["players"]
-        if user_id not in scores or str(wordle_num) not in scores[user_id]["games"]
-    ]
-
-# === Missing Command (non-ping) ===
-@bot.command(name="missing")
-async def missing(ctx):
-    scores = load_scores()
-    if not scores or "players" not in scores or not scores["players"]:
-        await ctx.send("No daily players have joined yet.")
-        return
-
-    # Get two most recent Wordle numbers
-    all_numbers = sorted({
-        int(num) for user_data in scores.values()
-        if isinstance(user_data, dict) and "games" in user_data
-        for num in user_data["games"].keys()
-    }, reverse=True)
-
-    if not all_numbers:
-        await ctx.send("No Wordle numbers found.")
-        return
-
-    track_numbers = all_numbers[:2]  # Max 2 puzzles
-
-    message_parts = []
-    for wordle_num in reversed(track_numbers):  # Show older first
-        missing_users = get_missing_for(scores, wordle_num)
-        if missing_users:
-            names = ", ".join([ (await bot.fetch_user(int(uid))).display_name for uid in missing_users ])
-            message_parts.append(f"Missing Wordle #{wordle_num}: {names}")
-
-    if not message_parts:
-        await ctx.send("Everyone has submitted the last two Wordles!")
-    else:
-        await ctx.send("\n".join(message_parts))
-
-# === PingMissing Command (ping version) ===
-@bot.command(name="pingmissing")
-@commands.has_permissions(administrator=True)
-async def pingmissing(ctx):
-    scores = load_scores()
-    if not scores or "players" not in scores or not scores["players"]:
-        await ctx.send("No daily players have joined yet.")
-        return
-
-    # Get two most recent Wordle numbers
-    all_numbers = sorted({
-        int(num) for user_data in scores.values()
-        if isinstance(user_data, dict) and "games" in user_data
-        for num in user_data["games"].keys()
-    }, reverse=True)
-
-    if not all_numbers:
-        await ctx.send("No Wordle numbers found.")
-        return
-
-    track_numbers = all_numbers[:2]  # Max 2 puzzles
-
-    message_parts = []
-    for wordle_num in reversed(track_numbers):  # Show older first
-        # Check how many have submitted this Wordle
-        submitted_players = [
-            uid for uid in scores["players"]
-            if uid in scores and str(wordle_num) in scores[uid].get("games", {})
-        ]
-
-        # Only ping if 2 or more players have submitted
-        if len(submitted_players) < 2:
-            continue
-
-        # Missing players for this Wordle
-        missing_users = get_missing_for(scores, wordle_num)
-        if missing_users:
-            mentions = ", ".join(f"<@{uid}>" for uid in missing_users)
-            message_parts.append(f"Missing Wordle #{wordle_num}: {mentions}")
-
-    if not message_parts:
-        await ctx.send("No one to ping (either no scores yet or fewer than 2 submissions).")
-    else:
-        await ctx.send("\n".join(message_parts))
-
-# === Backup Command ===
-@bot.command(name="backup")
-@commands.has_permissions(administrator=True)
-async def backup(ctx):
-    # Send current scores.json file as attachment
-    if not DATA_FILE.exists():
-        await ctx.send("No scores file found.")
-        return
-
-    await ctx.send(
-        "Here is the current scores backup file:",
-        file=discord.File(str(DATA_FILE), filename="scores.json")
-    )
-
-# === Daily Penalty Function (Midnight CST) ===
-def penalize_missing():
-    scores = load_scores()
-
-    if "players" not in scores or not scores["players"]:
-        return
-
-    # Get two most recent Wordle numbers
-    all_numbers = sorted({
-        int(num) for user_data in scores.values()
-        if isinstance(user_data, dict) and "games" in user_data
-        for num in user_data["games"].keys()
-    }, reverse=True)
-
-    if not all_numbers:
-        return
-
-    track_numbers = all_numbers[:2]  # Max 2 puzzles
-
-    # Add penalty (7 tries) for missing players
-    for wordle_num in track_numbers:
-        for user_id in scores["players"]:
-            if user_id in scores and str(wordle_num) in scores[user_id].get("games", {}):
-                continue
-            if user_id not in scores:
-                scores[user_id] = {"total": 0, "games": {}, "wins": 0}
-            scores[user_id]["games"][str(wordle_num)] = 7
-            scores[user_id]["total"] += 7
-            print(f"[PENALTY] Added 7 tries for user {user_id} on Wordle #{wordle_num}")
-
+    for uid in scores:
+        scores[uid]["games"] = {}
+        scores[uid]["total"] = 0
     save_scores(scores)
 
-# === Scheduler for Midnight Penalty ===
-scheduler = BackgroundScheduler(timezone=pytz.timezone("US/Central"))
-scheduler.add_job(penalize_missing, 'cron', hour=0, minute=0)
-scheduler.start()
+@bot.command()
+async def wins(ctx):
+    scores = load_scores()
+    lines = [
+        f"**{await bot.fetch_user(int(uid))}** — {data.get('wins', 0)} wins"
+        for uid, data in scores.items() if data.get("wins", 0) > 0
+    ]
+    if lines:
+        await ctx.send("__**🥇 Weekly Wins**__\n" + "\n".join(lines))
+    else:
+        await ctx.send("No wins recorded yet.")
 
-# === Flask Health Check for Render ===
+# === Flask Setup ===
 app = Flask(__name__)
-
 @app.route("/")
 def home():
     return "OK"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=10000)  # Render health check port
+    app.run(host="0.0.0.0", port=10000)
 
+# === Start Bot ===
 if __name__ == "__main__":
     Thread(target=run_flask).start()
     TOKEN = os.getenv("TOKEN")
-    if not TOKEN:
-        print("Error: TOKEN environment variable not set")
-    else:
+    if TOKEN:
         bot.run(TOKEN)
+    else:
+        print("TOKEN not set")
