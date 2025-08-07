@@ -15,7 +15,11 @@ DATA_FILE = Path("/tmp/scores.json")
 INIT_FILE = Path("scores.json")
 
 if not DATA_FILE.exists() and INIT_FILE.exists():
-    DATA_FILE.write_text(INIT_FILE.read_text())
+    with open(INIT_FILE, "r") as f:
+        data = json.load(f)
+        if "players" in data:
+            del data["players"]
+        DATA_FILE.write_text(json.dumps(data, separators=(',', ':')))
 
 # === Constants ===
 CENTRAL_TZ = pytz.timezone("America/Chicago")
@@ -38,35 +42,35 @@ def save_scores(scores):
         json.dump(scores, f, separators=(',', ':'))
 
 # === Wordle Helper ===
-# Anchor (efficient reference)
 anchor_wordle_number = 1509
 anchor_date = date(2025, 8, 6)
 
-# Wordle number to date
 def wordle_to_date(wordle_num):
     delta = wordle_num - anchor_wordle_number
     return anchor_date + timedelta(days=delta)
 
-# Date to Wordle number
 def date_to_wordle(some_date):
     delta = (some_date - anchor_date).days
     return anchor_wordle_number + delta
-  
+
 # === Scheduler ===
 @tasks.loop(minutes=1)
 async def daily_penalty_check():
     now = datetime.now(CENTRAL_TZ)
-    if now.hour == 0 and now.minute == 1:  # 12:01 AM CST
+    if now.hour == 0 and now.minute == 1:
         scores = load_scores()
         yesterday = now.date() - timedelta(days=1)
-        wordle_num = get_wordle_number_for_date(yesterday)
+        wordle_num = date_to_wordle(yesterday)
 
-        joined_users = {uid for uid in scores if "joined" in scores[uid] and scores[uid]["joined"]}
+        joined_users = {
+            uid for uid, data in scores.items()
+            if isinstance(data, dict) and data.get("joined")
+        }
         penalized = []
 
         for uid in joined_users:
-            if wordle_num not in scores[uid]["games"]:
-                scores[uid]["games"][wordle_num] = 7
+            if str(wordle_num) not in scores[uid]["games"]:
+                scores[uid]["games"][str(wordle_num)] = 7
                 scores[uid]["total"] += 7
                 penalized.append(uid)
 
@@ -116,7 +120,10 @@ async def leaderboard(ctx):
     if not scores:
         await ctx.send("No scores yet.")
         return
-    sorted_scores = sorted(scores.items(), key=lambda x: x[1]["total"])
+    sorted_scores = sorted(
+        [(uid, data) for uid, data in scores.items() if isinstance(data, dict)],
+        key=lambda x: x[1]["total"]
+    )
     lines = [
         f"**{await bot.fetch_user(int(uid))}** — {data['total']} tries over {len(data['games'])} games"
         for uid, data in sorted_scores
@@ -147,9 +154,14 @@ async def leavewordle(ctx):
 @commands.has_permissions(administrator=True)
 async def resetweek(ctx):
     scores = load_scores()
-    winner = min((
-        (uid, data["total"]) for uid, data in scores.items() if data["games"]
-    ), key=lambda x: x[1], default=(None, None))
+    winner = min(
+        (
+            (uid, data["total"]) for uid, data in scores.items()
+            if isinstance(data, dict) and data["games"]
+        ),
+        key=lambda x: x[1],
+        default=(None, None)
+    )
 
     if winner[0]:
         scores[winner[0]]["wins"] = scores[winner[0]].get("wins", 0) + 1
@@ -157,8 +169,9 @@ async def resetweek(ctx):
         await ctx.send(f"🎉 Congrats {winner_name} for winning the week with {winner[1]} total tries!")
 
     for uid in scores:
-        scores[uid]["games"] = {}
-        scores[uid]["total"] = 0
+        if isinstance(scores[uid], dict):
+            scores[uid]["games"] = {}
+            scores[uid]["total"] = 0
     save_scores(scores)
 
 @bot.command()
@@ -166,15 +179,37 @@ async def wins(ctx):
     scores = load_scores()
     lines = [
         f"**{await bot.fetch_user(int(uid))}** — {data.get('wins', 0)} wins"
-        for uid, data in scores.items() if data.get("wins", 0) > 0
+        for uid, data in scores.items()
+        if isinstance(data, dict) and data.get("wins", 0) > 0
     ]
     if lines:
         await ctx.send("__**🥇 Weekly Wins**__\n" + "\n".join(lines))
     else:
         await ctx.send("No wins recorded yet.")
 
+@bot.command()
+async def missing(ctx):
+    scores = load_scores()
+    today = datetime.now(CENTRAL_TZ).date()
+    wordle_num = str(date_to_wordle(today))
+
+    joined_users = {
+        uid for uid, data in scores.items()
+        if isinstance(data, dict) and data.get("joined")
+    }
+    missing = [
+        await bot.fetch_user(int(uid)) for uid in joined_users
+        if wordle_num not in scores[uid]["games"]
+    ]
+
+    if missing:
+        await ctx.send("__**📋 Players Missing Today's Wordle**__\n" + ", ".join(user.name for user in missing))
+    else:
+        await ctx.send("✅ Everyone has submitted today's Wordle!")
+
 # === Flask Setup ===
 app = Flask(__name__)
+
 @app.route("/")
 def home():
     return "OK"
