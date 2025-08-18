@@ -412,12 +412,22 @@ async def missing(ctx):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def backup(ctx):
-    """Create a backup of the scores file."""
+    """Create a backup and upload it as a file in Discord."""
     scores = load_scores()
-    backup_file = f"/tmp/scores_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(backup_file, "w") as f:
+    ts = datetime.now(CENTRAL_TZ).strftime("%Y%m%d_%H%M%S")
+    fn = f"scores_backup_{ts}.json"
+    path = f"/tmp/{fn}"
+
+    # write to /tmp (still handy if you want to shell in later)
+    with open(path, "w") as f:
         json.dump(scores, f, indent=2)
-    await ctx.send(f"💾 Backup created: `{backup_file}`")
+
+    # upload the file to the channel
+    await ctx.send(
+        content="💾 Backup created:",
+        file=discord.File(path, filename=fn)
+    )
+
 
 # === Flask Setup ===
 app = Flask(__name__)
