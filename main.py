@@ -47,7 +47,11 @@ def _is_user_record(k, v):
     return isinstance(v, dict) and not str(k).startswith("_") and ("total" in v and "games" in v)
 
 # Ensure a meta bucket exists (for duel state)
-_DEF_META = {"duel": None}
+_DEF_META = {
+    "duel": None,
+    "last_podium": {"gold": [], "silver": [], "bronze": []},
+    "pending_podium": None  # used when a duel rolls into next week
+}
 
 def ensure_meta(scores: dict):
     if not isinstance(scores, dict):
@@ -182,10 +186,31 @@ async def on_message(message):
                     if t1 != t2:
                         winner_id = p1 if t1 < t2 else p2
                         scores[winner_id]["wins"] = scores[winner_id].get("wins", 0) + 1
+                    
+                        # Build last week's podium now that duel is decided
+                        ensure_meta(scores)
+                        pending = scores["_meta"].get("pending_podium")
+                        gold = [winner_id]
+                        silver = []
+                        bronze = []
+                    
+                        if pending and isinstance(pending, dict):
+                            tied_first = pending.get("tied_first", [])
+                            bronze = pending.get("bronze", [])
+                            # Silver = everyone who was tied for first EXCEPT the winner
+                            silver = [uid for uid in tied_first if uid != winner_id]
+                        else:
+                            # Fallback: if no pending data (shouldn’t happen), just set gold only
+                            silver, bronze = [], []
+                    
+                        scores["_meta"]["last_podium"] = {"gold": gold, "silver": silver, "bronze": bronze}
                         scores["_meta"]["duel"] = None
+                        scores["_meta"]["pending_podium"] = None
+                    
                         save_scores(scores)
                         winner_user = await bot.fetch_user(int(winner_id))
                         await message.channel.send(f"👑 Sudden-death duel decided! Congrats {winner_user.display_name}!")
+
                     else:
                         next_wordle = int(wordle_number) + 1
                         scores["_meta"]["duel"]["wordle"] = next_wordle
@@ -202,36 +227,33 @@ async def on_message(message):
 @bot.command()
 async def leaderboard(ctx):
     scores = load_scores()
+    ensure_meta(scores)
     if not scores:
         await ctx.send("No scores yet.")
         return
+
+    podium = scores["_meta"].get("last_podium", {"gold": [], "silver": [], "bronze": []})
+
     # Only real user records (ignore internal keys)
     entries = [(uid, data) for uid, data in scores.items()
                if isinstance(data, dict) and not str(uid).startswith("_") and "total" in data and "games" in data]
     entries.sort(key=lambda x: x[1]["total"])  # ascending
 
+    def medal_for(uid: str) -> str:
+        if uid in podium.get("gold", []):
+            return "👑 "
+        if uid in podium.get("silver", []):
+            return "🥈 "
+        if uid in podium.get("bronze", []):
+            return "🥉 "
+        return ""
+
     lines = []
-    i = 0
-    while i < len(entries):
-        # group by same total (tie block)
-        same = [entries[i]]
-        j = i + 1
-        while j < len(entries) and entries[j][1]["total"] == entries[i][1]["total"]:
-            same.append(entries[j])
-            j += 1
-        rank = i + 1  # competition ranking (1,2,2,4)
-        medal = ""
-        if rank == 1:
-            medal = "👑 "
-        elif rank == 2:
-            medal = "🥈 "
-        elif rank == 3:
-            medal = "🥉 "
-        for uid, data in same:
-            user = await bot.fetch_user(int(uid))
-            gp = len(data["games"])
-            lines.append(f"{medal}**{user.display_name}** — {data['total']} tries over {gp} games")
-        i = j
+    for uid, data in entries:
+        user = await bot.fetch_user(int(uid))
+        gp = len(data["games"])
+        prefix = medal_for(uid)
+        lines.append(f"{prefix}**{user.display_name}** — {data['total']} tries over {gp} games")
 
     await ctx.send("__**🏆 Wordle Leaderboard**__\n" + "\n".join(lines))
 
@@ -267,27 +289,84 @@ async def resetweek(ctx):
         await ctx.send("No scores to reset.")
         return
 
-    entries.sort(key=lambda x: x[1]["total"])  # ascending
+    # Sort by weekly total ascending
+    entries.sort(key=lambda x: x[1]["total"])
     top_total = entries[0][1]["total"]
-    tied = [uid for uid, data in entries if data["total"] == top_total]
 
-    if len(tied) == 1:
-        winner_id = tied[0]
+    # Build competition ranks (1,2,2,4) to capture tie groups
+    blocks = []
+    i = 0
+    while i < len(entries):
+        same = [entries[i]]
+        j = i + 1
+        while j < len(entries) and entries[j][1]["total"] == entries[i][1]["total"]:
+            same.append(entries[j])
+            j += 1
+        rank = i + 1
+        blocks.append((rank, same))
+        i = j
+
+    # Helper to extract user IDs for a block
+    def ids(block):
+        return [uid for uid, _ in block]
+
+    # Check tie for first
+    rank1, block1 = blocks[0]
+    tied_first = ids(block1)
+
+    if len(tied_first) == 1:
+        # Clear duel state
+        scores["_meta"]["duel"] = None
+        scores["_meta"]["pending_podium"] = None
+
+        # Finalize podium now using competition ranking
+        gold = tied_first
+        silver = []
+        bronze = []
+
+        # Find rank 2 block (if any)
+        if len(blocks) >= 2 and blocks[1][0] == 2:
+            silver = ids(blocks[1][1])
+        # Find rank 3 block (if any)
+        if len(blocks) >= 3 and blocks[2][0] == 3:
+            bronze = ids(blocks[2][1])
+
+        # Store last week's podium
+        scores["_meta"]["last_podium"] = {"gold": gold, "silver": silver, "bronze": bronze}
+
+        # Increment wins and announce winner
+        winner_id = gold[0]
         scores[winner_id]["wins"] = scores[winner_id].get("wins", 0) + 1
         winner_user = await bot.fetch_user(int(winner_id))
         await ctx.send(f"🎉 Congrats {winner_user.display_name} for winning the week with {top_total} total tries!")
     else:
-        # Set up sudden-death duel on the NEXT day's Wordle (e.g., Monday after Sunday reset)
+        # Tie for first: create a duel for tomorrow's Wordle
         tomorrow_cst = datetime.now(CENTRAL_TZ).date() + timedelta(days=1)
         duel_wordle = int(date_to_wordle(tomorrow_cst))
-        scores["_meta"]["duel"] = {"players": tied, "wordle": duel_wordle}
+        scores["_meta"]["duel"] = {"players": tied_first, "wordle": duel_wordle}
+
+        # Precompute bronze block: competition ranking says silver will be the losers of the duel
+        # so bronze is whatever has rank == (1 + len(tied_first)) + 1 (i.e., rank 3+ when k==2).
+        # We can simply capture the first block whose rank >= 3:
+        bronze_ids = []
+        for r, blk in blocks:
+            if r >= 3:
+                bronze_ids = ids(blk)
+                break
+
+        scores["_meta"]["pending_podium"] = {
+            "tied_first": tied_first,  # duel contestants
+            "bronze": bronze_ids       # fixed bronze group regardless of duel result
+        }
+
+        # Announce tie + duel
         names = []
-        for uid in tied:
+        for uid in tied_first:
             u = await bot.fetch_user(int(uid))
             names.append(u.display_name)
         await ctx.send(f"⚔️ Weekly tie! Sudden-death duel on Wordle #{duel_wordle}: {', '.join(names)}")
 
-    # Reset week but keep wins/joined (duel state kept in _meta)
+    # Reset week but keep wins/joined
     for uid, data in list(scores.items()):
         if _is_user_record(uid, data):
             data["games"] = {}
@@ -296,7 +375,6 @@ async def resetweek(ctx):
 
     save_scores(scores)
     await ctx.send("Scores have been reset for the new week!")
-
 
 @bot.command()
 async def wins(ctx):
