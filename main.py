@@ -331,6 +331,16 @@ async def missing(ctx):
     else:
         await ctx.send("✅ Everyone has submitted today's Wordle!")
 
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def backup(ctx):
+    """Create a backup of the scores file."""
+    scores = load_scores()
+    backup_file = f"/tmp/scores_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(backup_file, "w") as f:
+        json.dump(scores, f, indent=2)
+    await ctx.send(f"💾 Backup created: `{backup_file}`")
+
 # === Flask Setup ===
 app = Flask(__name__)
 
