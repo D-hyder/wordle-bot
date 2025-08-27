@@ -9,6 +9,8 @@ from flask import Flask
 from threading import Thread
 from datetime import datetime, timedelta, date
 import pytz
+import time
+import asyncio
 
 # === File Paths ===
 DATA_FILE = Path("/tmp/scores.json")
@@ -444,9 +446,38 @@ def run_flask():
 
 # === Start Bot ===
 if __name__ == "__main__":
+    # start Flask sidecar
     Thread(target=run_flask).start()
+
     TOKEN = os.getenv("TOKEN")
-    if TOKEN:
-        bot.run(TOKEN)
-    else:
+    if not TOKEN:
         print("TOKEN not set")
+    else:
+        async def start_with_backoff():
+            delay = 30  # seconds; first backoff
+            while True:
+                try:
+                    await bot.start(TOKEN)   # (same as bot.run but awaitable)
+                except discord.HTTPException as e:
+                    # If Cloudflare/Discord says "Too Many Requests", back off and try again
+                    if getattr(e, "status", None) == 429:
+                        print(f"[login] 429 rate limited; sleeping {delay}s")
+                        await asyncio.sleep(delay)
+                        # cap/max backoff ~10 minutes
+                        delay = min(delay * 2, 600)
+                        continue
+                    else:
+                        # other HTTP errors: print and short sleep to avoid tight loops
+                        print(f"[login] HTTP error {e.status if hasattr(e,'status') else '?'}; retrying in 60s")
+                        await asyncio.sleep(60)
+                        continue
+                except Exception as ex:
+                    # Any other unexpected crash on startup: wait a bit then retry
+                    print(f"[login] unexpected error: {ex}; retrying in 60s")
+                    await asyncio.sleep(60)
+                    continue
+                else:
+                    # bot.start returned (normally only when closed); break out
+                    break
+
+        asyncio.run(start_with_backoff())
