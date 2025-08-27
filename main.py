@@ -78,36 +78,27 @@ async def build_leaderboard_text():
     if not scores:
         return "No scores yet."
 
+    podium = scores["_meta"].get("last_podium", {"gold": [], "silver": [], "bronze": []})
+
     # Only real user records (ignore internal keys)
     entries = [(uid, data) for uid, data in scores.items()
                if isinstance(data, dict) and not str(uid).startswith("_")
                and "total" in data and "games" in data]
-    entries.sort(key=lambda x: x[1]["total"])  # ascending
+    entries.sort(key=lambda x: x[1]["total"])  # ascending (display order only)
+
+    def medal_for(uid: str) -> str:
+        if uid in podium.get("gold", []): return "👑 "
+        if uid in podium.get("silver", []): return "🥈 "
+        if uid in podium.get("bronze", []): return "🥉 "
+        return ""
 
     lines = []
-    i = 0
-    while i < len(entries):
-        # group by same total (tie block)
-        same = [entries[i]]
-        j = i + 1
-        while j < len(entries) and entries[j][1]["total"] == entries[i][1]["total"]:
-            same.append(entries[j])
-            j += 1
-        rank = i + 1  # competition ranking (1,2,2,4)
-        medal = ""
-        if rank == 1:
-            medal = "👑 "
-        elif rank == 2:
-            medal = "🥈 "
-        elif rank == 3:
-            medal = "🥉 "
-        for uid, data in same:
-            user = await bot.fetch_user(int(uid))
-            gp = len(data["games"])
-            lines.append(f"{medal}**{user.display_name}** — {data['total']} tries over {gp} games")
-        i = j
+    for uid, data in entries:
+        user = await bot.fetch_user(int(uid))
+        gp = len(data["games"])
+        lines.append(f"{medal_for(uid)}**{user.display_name}** — {data['total']} tries over {gp} games")
 
-    return "__**🏆 Wordle Leaderboard**__\n" + "\n".join(lines)
+    await ctx.send("__**🏆 Wordle Leaderboard**__\n" + "\n".join(lines))
 
 # === Scheduler ===
 @tasks.loop(hours=1)
