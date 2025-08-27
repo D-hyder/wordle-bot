@@ -73,6 +73,42 @@ def wordle_to_date(wordle_num: int) -> date:
 def date_to_wordle(some_date: date) -> int:
     return (some_date - WORDLE_EPOCH).days
 
+async def build_leaderboard_text():
+    scores = load_scores()
+    if not scores:
+        return "No scores yet."
+
+    # Only real user records (ignore internal keys)
+    entries = [(uid, data) for uid, data in scores.items()
+               if isinstance(data, dict) and not str(uid).startswith("_")
+               and "total" in data and "games" in data]
+    entries.sort(key=lambda x: x[1]["total"])  # ascending
+
+    lines = []
+    i = 0
+    while i < len(entries):
+        # group by same total (tie block)
+        same = [entries[i]]
+        j = i + 1
+        while j < len(entries) and entries[j][1]["total"] == entries[i][1]["total"]:
+            same.append(entries[j])
+            j += 1
+        rank = i + 1  # competition ranking (1,2,2,4)
+        medal = ""
+        if rank == 1:
+            medal = "👑 "
+        elif rank == 2:
+            medal = "🥈 "
+        elif rank == 3:
+            medal = "🥉 "
+        for uid, data in same:
+            user = await bot.fetch_user(int(uid))
+            gp = len(data["games"])
+            lines.append(f"{medal}**{user.display_name}** — {data['total']} tries over {gp} games")
+        i = j
+
+    return "__**🏆 Wordle Leaderboard**__\n" + "\n".join(lines)
+
 # === Scheduler ===
 @tasks.loop(hours=1)
 async def daily_penalty_check():
@@ -220,43 +256,20 @@ async def on_message(message):
         save_scores(scores)
         await message.channel.send(f"✅ Wordle #{wordle_number} recorded — {tries} tries for {message.author.display_name}!")
 
+        try:
+            lb_text = await build_leaderboard_text()
+            await message.channel.send(lb_text)
+        except Exception:
+            pass
+            
     await bot.process_commands(message)
 
 
 # === Commands ===
 @bot.command()
 async def leaderboard(ctx):
-    scores = load_scores()
-    ensure_meta(scores)
-    if not scores:
-        await ctx.send("No scores yet.")
-        return
-
-    podium = scores["_meta"].get("last_podium", {"gold": [], "silver": [], "bronze": []})
-
-    # Only real user records (ignore internal keys)
-    entries = [(uid, data) for uid, data in scores.items()
-               if isinstance(data, dict) and not str(uid).startswith("_") and "total" in data and "games" in data]
-    entries.sort(key=lambda x: x[1]["total"])  # ascending
-
-    def medal_for(uid: str) -> str:
-        if uid in podium.get("gold", []):
-            return "👑 "
-        if uid in podium.get("silver", []):
-            return "🥈 "
-        if uid in podium.get("bronze", []):
-            return "🥉 "
-        return ""
-
-    lines = []
-    for uid, data in entries:
-        user = await bot.fetch_user(int(uid))
-        gp = len(data["games"])
-        prefix = medal_for(uid)
-        lines.append(f"{prefix}**{user.display_name}** — {data['total']} tries over {gp} games")
-
-    await ctx.send("__**🏆 Wordle Leaderboard**__\n" + "\n".join(lines))
-
+    text = await build_leaderboard_text()
+    await ctx.send(text)
 
 @bot.command()
 async def joinwordle(ctx):
