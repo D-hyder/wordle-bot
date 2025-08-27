@@ -9,7 +9,9 @@ from flask import Flask
 from threading import Thread
 from datetime import datetime, timedelta, date
 import pytz
-import asyncio, sys
+import time
+import asyncio
+import aiohttp
 
 # === File Paths ===
 DATA_FILE = Path("/tmp/scores.json")
@@ -461,27 +463,50 @@ if __name__ == "__main__":
         # sys.exit(1)  # uncomment if you prefer failing the deploy instead of running Flask only
     else:
         async def start_with_backoff():
-            delay = 30
+            delay = 30  # first backoff (seconds)
+        
             while True:
                 try:
-                    print("🔌 discord: attempting bot.start()")
-                    await bot.start(TOKEN)
+                    print("🔑 discord: static_login()…")
+                    await asyncio.wait_for(bot.login(TOKEN), timeout=20)
+        
+                    print("🌐 discord: connecting to gateway…")
+                    await asyncio.wait_for(bot.connect(reconnect=True), timeout=90)
+        
+                    print("✅ discord: bot.connect() returned cleanly (closed)")
+                    break
+        
                 except discord.HTTPException as e:
-                    if getattr(e, "status", None) == 429:
-                        print(f"⏳ discord: 429 rate limited; sleeping {delay}s")
+                    status = getattr(e, "status", None)
+                    if status == 401:
+                        print("❌ discord: 401 Unauthorized — TOKEN is invalid.")
+                        await asyncio.sleep(300)
+                        break
+                    if status == 429:
+                        print(f"⏳ discord: 429 Too Many Requests — sleeping {delay}s before retry")
                         await asyncio.sleep(delay)
                         delay = min(delay * 2, 600)
-                        continue
-                    print(f"⚠️  discord: HTTP error {getattr(e,'status','?')}; retrying in 60s")
-                    await asyncio.sleep(60)
+                    else:
+                        print(f"⚠️  discord: HTTP error {status}; retrying in 60s")
+                        await asyncio.sleep(60)
+        
+                except (asyncio.TimeoutError, aiohttp.ClientError) as net_ex:
+                    print(f"🌩️ discord: network/timeout during login/connect: {net_ex} — retrying in {delay}s")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 600)
+        
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     print("🛑 discord: shutdown requested")
                     break
+        
                 except Exception as ex:
-                    print(f"💥 discord: unexpected: {ex}; retrying in 60s")
+                    print(f"💥 discord: unexpected startup error: {ex} — retrying in 60s")
                     await asyncio.sleep(60)
-                else:
-                    print("✅ discord: bot.start() returned cleanly")
-                    break
+        
+                finally:
+                    try:
+                        await bot.close()
+                    except Exception:
+                        pass
 
         asyncio.run(start_with_backoff())
