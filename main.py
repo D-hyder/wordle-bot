@@ -85,7 +85,7 @@ async def build_leaderboard_text():
     entries = [(uid, data) for uid, data in scores.items()
                if isinstance(data, dict) and not str(uid).startswith("_")
                and "total" in data and "games" in data]
-    # Order by current totals (display order only)
+    # Current totals control display order (not medals)
     entries.sort(key=lambda x: x[1]["total"])
 
     def medal_for(uid: str) -> str:
@@ -249,12 +249,9 @@ async def on_message(message):
         save_scores(scores)
         await message.channel.send(f"✅ Wordle #{wordle_number} recorded — {tries} tries for {message.author.display_name}!")
 
-        try:
-            lb_text = await build_leaderboard_text()
-            await message.channel.send(lb_text)
-        except Exception:
-            pass
-            
+        lb_text = await build_leaderboard_text()
+        await message.channel.send(lb_text)
+
     await bot.process_commands(message)
 
 
