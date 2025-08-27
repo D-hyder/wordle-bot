@@ -9,6 +9,7 @@ from flask import Flask
 from threading import Thread
 from datetime import datetime, timedelta, date
 import pytz
+import asyncio, sys
 
 # === File Paths ===
 DATA_FILE = Path("/tmp/scores.json")
@@ -85,8 +86,7 @@ async def build_leaderboard_text():
     entries = [(uid, data) for uid, data in scores.items()
                if isinstance(data, dict) and not str(uid).startswith("_")
                and "total" in data and "games" in data]
-    entries.sort(key=lambda x: x[1]["total"])  # ascending (display order only)
-    # Order by current totals (display order only)
+    # Current totals control display order (not medals)
     entries.sort(key=lambda x: x[1]["total"])
 
     def medal_for(uid: str) -> str:
@@ -101,7 +101,6 @@ async def build_leaderboard_text():
         gp = len(data["games"])
         lines.append(f"{medal_for(uid)}**{user.display_name}** — {data['total']} tries over {gp} games")
 
-    await ctx.send("__**🏆 Wordle Leaderboard**__\n" + "\n".join(lines))
     return "__**🏆 Wordle Leaderboard**__\n" + "\n".join(lines)
 
 # === Scheduler ===
@@ -169,7 +168,7 @@ async def nightly_missing_alert():
                 names.append(user.display_name)
             except Exception:
                 pass
-
+                
         if names:
             mentions = ", ".join(f"<@{uid}>" for uid in missing_ids)
             await channel.send(f"⏰ Reminder: {mentions} still need to submit today’s Wordle!")
@@ -217,14 +216,14 @@ async def on_message(message):
                     if t1 != t2:
                         winner_id = p1 if t1 < t2 else p2
                         scores[winner_id]["wins"] = scores[winner_id].get("wins", 0) + 1
-
+                    
                         # Build last week's podium now that duel is decided
                         ensure_meta(scores)
                         pending = scores["_meta"].get("pending_podium")
                         gold = [winner_id]
                         silver = []
                         bronze = []
-
+                    
                         if pending and isinstance(pending, dict):
                             tied_first = pending.get("tied_first", [])
                             bronze = pending.get("bronze", [])
@@ -233,11 +232,11 @@ async def on_message(message):
                         else:
                             # Fallback: if no pending data (shouldn’t happen), just set gold only
                             silver, bronze = [], []
-
+                    
                         scores["_meta"]["last_podium"] = {"gold": gold, "silver": silver, "bronze": bronze}
                         scores["_meta"]["duel"] = None
                         scores["_meta"]["pending_podium"] = None
-
+                    
                         save_scores(scores)
                         winner_user = await bot.fetch_user(int(winner_id))
                         await message.channel.send(f"👑 Sudden-death duel decided! Congrats {winner_user.display_name}!")
@@ -251,11 +250,8 @@ async def on_message(message):
         save_scores(scores)
         await message.channel.send(f"✅ Wordle #{wordle_number} recorded — {tries} tries for {message.author.display_name}!")
 
-        try:
-            lb_text = await build_leaderboard_text()
-            await message.channel.send(lb_text)
-        except Exception:
-            pass
+        lb_text = await build_leaderboard_text()
+        await message.channel.send(lb_text)
 
     await bot.process_commands(message)
 
@@ -447,11 +443,45 @@ def home():
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
 
+@bot.event
+async def on_ready():
+    print(f"✅ Bot is ready as {bot.user} (guilds={len(bot.guilds)})")
+
 # === Start Bot ===
 if __name__ == "__main__":
+    print("▶️  boot: entering main")
     Thread(target=run_flask).start()
+    print("🌐 flask: sidecar started")
+
     TOKEN = os.getenv("TOKEN")
-    if TOKEN:
-        bot.run(TOKEN)
+    print(f"🔑 env TOKEN present? {'yes' if TOKEN else 'no'}")
+
+    if not TOKEN:
+        print("❌ TOKEN not set — Discord bot will NOT start")
+        # sys.exit(1)  # uncomment if you prefer failing the deploy instead of running Flask only
     else:
-        print("TOKEN not set")
+        async def start_with_backoff():
+            delay = 30
+            while True:
+                try:
+                    print("🔌 discord: attempting bot.start()")
+                    await bot.start(TOKEN)
+                except discord.HTTPException as e:
+                    if getattr(e, "status", None) == 429:
+                        print(f"⏳ discord: 429 rate limited; sleeping {delay}s")
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, 600)
+                        continue
+                    print(f"⚠️  discord: HTTP error {getattr(e,'status','?')}; retrying in 60s")
+                    await asyncio.sleep(60)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    print("🛑 discord: shutdown requested")
+                    break
+                except Exception as ex:
+                    print(f"💥 discord: unexpected: {ex}; retrying in 60s")
+                    await asyncio.sleep(60)
+                else:
+                    print("✅ discord: bot.start() returned cleanly")
+                    break
+
+        asyncio.run(start_with_backoff())
