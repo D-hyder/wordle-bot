@@ -75,6 +75,7 @@ def date_to_wordle(some_date: date) -> int:
 
 async def build_leaderboard_text():
     scores = load_scores()
+    ensure_meta(scores)
     if not scores:
         return "No scores yet."
 
@@ -84,7 +85,8 @@ async def build_leaderboard_text():
     entries = [(uid, data) for uid, data in scores.items()
                if isinstance(data, dict) and not str(uid).startswith("_")
                and "total" in data and "games" in data]
-    entries.sort(key=lambda x: x[1]["total"])  # ascending (display order only)
+    # Order by current totals (display order only)
+    entries.sort(key=lambda x: x[1]["total"])
 
     def medal_for(uid: str) -> str:
         if uid in podium.get("gold", []): return "👑 "
@@ -98,7 +100,7 @@ async def build_leaderboard_text():
         gp = len(data["games"])
         lines.append(f"{medal_for(uid)}**{user.display_name}** — {data['total']} tries over {gp} games")
 
-    await ctx.send("__**🏆 Wordle Leaderboard**__\n" + "\n".join(lines))
+    return "__**🏆 Wordle Leaderboard**__\n" + "\n".join(lines)
 
 # === Scheduler ===
 @tasks.loop(hours=1)
