@@ -467,11 +467,25 @@ if __name__ == "__main__":
         
             while True:
                 try:
+                    # 1) Verify token via HTTP (fast) with a timeout
                     print("🔑 discord: static_login()…")
-                    await asyncio.wait_for(bot.login(TOKEN), timeout=20)
+                    try:
+                        await asyncio.wait_for(bot.login(TOKEN), timeout=20)
+                    except asyncio.TimeoutError:
+                        print("⚠️ discord: login hung for 20s — likely invalid token or Cloudflare IP block")
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, 600)
+                        continue
         
+                    # 2) Connect to the gateway with a timeout
                     print("🌐 discord: connecting to gateway…")
-                    await asyncio.wait_for(bot.connect(reconnect=True), timeout=90)
+                    try:
+                        await asyncio.wait_for(bot.connect(reconnect=True), timeout=90)
+                    except asyncio.TimeoutError:
+                        print("⚠️ discord: gateway connect hung for 90s — network issue or rate-limit")
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, 600)
+                        continue
         
                     print("✅ discord: bot.connect() returned cleanly (closed)")
                     break
@@ -479,7 +493,7 @@ if __name__ == "__main__":
                 except discord.HTTPException as e:
                     status = getattr(e, "status", None)
                     if status == 401:
-                        print("❌ discord: 401 Unauthorized — TOKEN is invalid.")
+                        print("❌ discord: 401 Unauthorized — TOKEN is invalid. Regenerate the Bot Token and update Render’s env.")
                         await asyncio.sleep(300)
                         break
                     if status == 429:
@@ -487,17 +501,8 @@ if __name__ == "__main__":
                         await asyncio.sleep(delay)
                         delay = min(delay * 2, 600)
                     else:
-                        print(f"⚠️  discord: HTTP error {status}; retrying in 60s")
+                        print(f"⚠️ discord: HTTP error {status}; retrying in 60s")
                         await asyncio.sleep(60)
-        
-                except (asyncio.TimeoutError, aiohttp.ClientError) as net_ex:
-                    print(f"🌩️ discord: network/timeout during login/connect: {net_ex} — retrying in {delay}s")
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, 600)
-        
-                except (asyncio.CancelledError, KeyboardInterrupt):
-                    print("🛑 discord: shutdown requested")
-                    break
         
                 except Exception as ex:
                     print(f"💥 discord: unexpected startup error: {ex} — retrying in 60s")
@@ -508,5 +513,6 @@ if __name__ == "__main__":
                         await bot.close()
                     except Exception:
                         pass
+
 
         asyncio.run(start_with_backoff())
