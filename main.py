@@ -293,9 +293,13 @@ async def resetweek(ctx):
     scores = load_scores()
     ensure_meta(scores)
 
-    entries = [(uid, data) for uid, data in scores.items() if _is_user_record(uid, data)]
+    # Only count players who are currently joined
+    entries = [
+        (uid, data) for uid, data in scores.items()
+        if _is_user_record(uid, data) and data.get("joined")  # << key change
+    ]
     if not entries:
-        await ctx.send("No scores to reset.")
+        await ctx.send("No joined players to score this week.")
         return
 
     # Sort by weekly total ascending
@@ -315,11 +319,10 @@ async def resetweek(ctx):
         blocks.append((rank, same))
         i = j
 
-    # Helper to extract user IDs for a block
     def ids(block):
         return [uid for uid, _ in block]
 
-    # Check tie for first
+    # Tie check for first
     rank1, block1 = blocks[0]
     tied_first = ids(block1)
 
@@ -328,35 +331,29 @@ async def resetweek(ctx):
         scores["_meta"]["duel"] = None
         scores["_meta"]["pending_podium"] = None
 
-        # Finalize podium now using competition ranking
+        # Finalize podium using competition ranking among joined players
         gold = tied_first
         silver = []
         bronze = []
 
-        # Find rank 2 block (if any)
         if len(blocks) >= 2 and blocks[1][0] == 2:
             silver = ids(blocks[1][1])
-        # Find rank 3 block (if any)
         if len(blocks) >= 3 and blocks[2][0] == 3:
             bronze = ids(blocks[2][1])
 
-        # Store last week's podium
         scores["_meta"]["last_podium"] = {"gold": gold, "silver": silver, "bronze": bronze}
 
-        # Increment wins and announce winner
         winner_id = gold[0]
         scores[winner_id]["wins"] = scores[winner_id].get("wins", 0) + 1
         winner_user = await bot.fetch_user(int(winner_id))
         await ctx.send(f"🎉 Congrats {winner_user.display_name} for winning the week with {top_total} total tries!")
     else:
-        # Tie for first: create a duel for tomorrow's Wordle
+        # Tie for first: create a duel for tomorrow's Wordle (between joined players)
         tomorrow_cst = datetime.now(CENTRAL_TZ).date() + timedelta(days=1)
         duel_wordle = int(date_to_wordle(tomorrow_cst))
         scores["_meta"]["duel"] = {"players": tied_first, "wordle": duel_wordle}
 
-        # Precompute bronze block: competition ranking says silver will be the losers of the duel
-        # so bronze is whatever has rank == (1 + len(tied_first)) + 1 (i.e., rank 3+ when k==2).
-        # We can simply capture the first block whose rank >= 3:
+        # Bronze is the first block with rank >= 3 (still among joined only)
         bronze_ids = []
         for r, blk in blocks:
             if r >= 3:
@@ -364,18 +361,17 @@ async def resetweek(ctx):
                 break
 
         scores["_meta"]["pending_podium"] = {
-            "tied_first": tied_first,  # duel contestants
-            "bronze": bronze_ids       # fixed bronze group regardless of duel result
+            "tied_first": tied_first,
+            "bronze": bronze_ids
         }
 
-        # Announce tie + duel
         names = []
         for uid in tied_first:
             u = await bot.fetch_user(int(uid))
             names.append(u.display_name)
         await ctx.send(f"⚔️ Weekly tie! Sudden-death duel on Wordle #{duel_wordle}: {', '.join(names)}")
 
-    # Reset week but keep wins/joined
+    # Reset week but keep wins/joined (for all users)
     for uid, data in list(scores.items()):
         if _is_user_record(uid, data):
             data["games"] = {}
@@ -384,6 +380,7 @@ async def resetweek(ctx):
 
     save_scores(scores)
     await ctx.send("Scores have been reset for the new week!")
+
 
 @bot.command()
 async def wins(ctx):
@@ -446,10 +443,6 @@ def home():
 
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
-
-@bot.event
-async def on_ready():
-    print(f"✅ Bot is ready as {bot.user} (guilds={len(bot.guilds)})")
 
 # === Start Bot ===
 if __name__ == "__main__":
