@@ -56,8 +56,11 @@ def _is_user_record(k, v):
 _DEF_META = {
     "duel": None,
     "last_podium": {"gold": [], "silver": [], "bronze": []},
-    "pending_podium": None  # used when a duel rolls into next week
+    "pending_podium": None,         # used when a duel rolls into next week
+    "skip_penalty_days": [],         # list of ISO dates (YYYY-MM-DD) to not penalize
+    "last_penalized_day": ""         # ISO date we last processed (idempotence)
 }
+
 
 def ensure_meta(scores: dict):
     if not isinstance(scores, dict):
@@ -112,32 +115,53 @@ async def build_leaderboard_text():
 @tasks.loop(hours=1)
 async def daily_penalty_check():
     now = datetime.now(CENTRAL_TZ)
-    if now.hour == 0:  # run once during the midnight hour (any minute)
-        scores = load_scores()
-        yesterday = now.date() - timedelta(days=1)
-        wordle_num = date_to_wordle(yesterday)
 
-        joined_users = {
-            uid for uid, data in scores.items()
-            if isinstance(data, dict) and data.get("joined")
-        }
-        penalized = []
+    # We run during the midnight hour CST, and we only want to apply once per day
+    if now.hour != 0:
+        return
 
-        for uid in joined_users:
-            if str(wordle_num) not in scores[uid]["games"]:
-                scores[uid]["games"][str(wordle_num)] = 7
-                scores[uid]["total"] += 7
-                penalized.append(uid)
+    scores = load_scores()
+    ensure_meta(scores)
 
-        if penalized:
-            channel = discord.utils.get(bot.get_all_channels(), name="general")
-            if channel:
-                mentions = ", ".join(f"<@{uid}>" for uid in penalized)
-                await channel.send(
-                    f"⏰ Auto-penalty: {mentions} were given 7 tries for missing Wordle #{wordle_num}."
-                )
+    target_day = (now.date() - timedelta(days=1))           # penalize yesterday's Wordle
+    stamp = target_day.isoformat()
+
+    # Already processed this day? bail
+    if scores["_meta"].get("last_penalized_day") == stamp:
+        return
+
+    # Admin asked to skip this day? mark as processed and bail
+    if stamp in scores["_meta"].get("skip_penalty_days", []):
+        scores["_meta"]["last_penalized_day"] = stamp
+        scores["_meta"]["skip_penalty_days"] = [
+            d for d in scores["_meta"]["skip_penalty_days"] if d != stamp
+        ]
         save_scores(scores)
+        return
 
+    wordle_num = str(date_to_wordle(target_day))
+
+    # Penalize only joined players who didn't submit
+    joined_users = {
+        uid for uid, data in scores.items()
+        if isinstance(data, dict) and data.get("joined")
+    }
+    penalized = []
+    for uid in joined_users:
+        if wordle_num not in scores[uid]["games"]:
+            scores[uid]["games"][wordle_num] = 7
+            scores[uid]["total"] += 7
+            penalized.append(uid)
+
+    # Mark processed and save
+    scores["_meta"]["last_penalized_day"] = stamp
+    save_scores(scores)
+
+    if penalized:
+        channel = discord.utils.get(bot.get_all_channels(), name="general")
+        if channel:
+            mentions = ", ".join(f"<@{uid}>" for uid in penalized)
+            await channel.send(f"⏰ Auto-penalty: {mentions} were given 7 tries for missing Wordle #{wordle_num}.")
 
 
 MISSING_CHANNEL_ID = "900458273117982791"  # optional channel ID
@@ -293,10 +317,10 @@ async def resetweek(ctx):
     scores = load_scores()
     ensure_meta(scores)
 
-    # Only count players who are currently joined
+    # ONLY count players currently joined
     entries = [
         (uid, data) for uid, data in scores.items()
-        if _is_user_record(uid, data) and data.get("joined")  # << key change
+        if _is_user_record(uid, data) and data.get("joined")
     ]
     if not entries:
         await ctx.send("No joined players to score this week.")
@@ -306,36 +330,28 @@ async def resetweek(ctx):
     entries.sort(key=lambda x: x[1]["total"])
     top_total = entries[0][1]["total"]
 
-    # Build competition ranks (1,2,2,4) to capture tie groups
-    blocks = []
-    i = 0
+    # Build competition ranks (1,2,2,4) for ties
+    blocks, i = [], 0
     while i < len(entries):
         same = [entries[i]]
         j = i + 1
         while j < len(entries) and entries[j][1]["total"] == entries[i][1]["total"]:
-            same.append(entries[j])
-            j += 1
+            same.append(entries[j]); j += 1
         rank = i + 1
         blocks.append((rank, same))
         i = j
 
-    def ids(block):
-        return [uid for uid, _ in block]
+    def ids(block): return [uid for uid, _ in block]
 
-    # Tie check for first
     rank1, block1 = blocks[0]
     tied_first = ids(block1)
 
     if len(tied_first) == 1:
-        # Clear duel state
+        # Clear duel state / pending podium
         scores["_meta"]["duel"] = None
         scores["_meta"]["pending_podium"] = None
 
-        # Finalize podium using competition ranking among joined players
-        gold = tied_first
-        silver = []
-        bronze = []
-
+        gold, silver, bronze = tied_first, [], []
         if len(blocks) >= 2 and blocks[1][0] == 2:
             silver = ids(blocks[1][1])
         if len(blocks) >= 3 and blocks[2][0] == 3:
@@ -348,30 +364,31 @@ async def resetweek(ctx):
         winner_user = await bot.fetch_user(int(winner_id))
         await ctx.send(f"🎉 Congrats {winner_user.display_name} for winning the week with {top_total} total tries!")
     else:
-        # Tie for first: create a duel for tomorrow's Wordle (between joined players)
+        # Tie -> duel tomorrow
         tomorrow_cst = datetime.now(CENTRAL_TZ).date() + timedelta(days=1)
         duel_wordle = int(date_to_wordle(tomorrow_cst))
         scores["_meta"]["duel"] = {"players": tied_first, "wordle": duel_wordle}
 
-        # Bronze is the first block with rank >= 3 (still among joined only)
         bronze_ids = []
         for r, blk in blocks:
             if r >= 3:
-                bronze_ids = ids(blk)
-                break
+                bronze_ids = ids(blk); break
 
-        scores["_meta"]["pending_podium"] = {
-            "tied_first": tied_first,
-            "bronze": bronze_ids
-        }
+        scores["_meta"]["pending_podium"] = {"tied_first": tied_first, "bronze": bronze_ids}
 
-        names = []
-        for uid in tied_first:
-            u = await bot.fetch_user(int(uid))
-            names.append(u.display_name)
+        names = [ (await bot.fetch_user(int(uid))).display_name for uid in tied_first ]
         await ctx.send(f"⚔️ Weekly tie! Sudden-death duel on Wordle #{duel_wordle}: {', '.join(names)}")
 
-    # Reset week but keep wins/joined (for all users)
+    # --- NEW: if today is Sunday (CST), skip tonight's penalty for Sunday ---
+    today_cst = datetime.now(CENTRAL_TZ).date()
+    if today_cst.weekday() == 6:   # Monday=0 ... Sunday=6
+        sunday_iso = today_cst.isoformat()
+        lst = scores["_meta"].get("skip_penalty_days", [])
+        if sunday_iso not in lst:
+            lst.append(sunday_iso)
+        scores["_meta"]["skip_penalty_days"] = lst
+
+    # Reset week but keep wins/joined
     for uid, data in list(scores.items()):
         if _is_user_record(uid, data):
             data["games"] = {}
