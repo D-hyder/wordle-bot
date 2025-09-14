@@ -52,10 +52,12 @@ def save_scores(scores):
 def _is_user_record(k, v):
     return isinstance(v, dict) and not str(k).startswith("_") and ("total" in v and "games" in v)
 
-# Ensure a meta bucket exists (for duel state)
 _DEF_META = {
     "duel": None,
-    "last_podium": {"gold": [], "silver": [], "bronze": []},
+    "last_podium": {"gold": [], "silver": [], "bronze": [], "waffle": []},
+    "pending_podium": None,
+    # keep your existing keys like skip_penalty_days / last_penalized_day if present
+}
     "pending_podium": None,         # used when a duel rolls into next week
     "skip_penalty_days": [],         # list of ISO dates (YYYY-MM-DD) to not penalize
     "last_penalized_day": ""         # ISO date we last processed (idempotence)
@@ -88,19 +90,18 @@ async def build_leaderboard_text():
     if not scores:
         return "No scores yet."
 
-    podium = scores["_meta"].get("last_podium", {"gold": [], "silver": [], "bronze": []})
+    podium = scores["_meta"].get("last_podium", {"gold": [], "silver": [], "bronze": [], "waffle": []})
 
-    # Only real user records (ignore internal keys)
     entries = [(uid, data) for uid, data in scores.items()
                if isinstance(data, dict) and not str(uid).startswith("_")
                and "total" in data and "games" in data]
-    # Current totals control display order (not medals)
     entries.sort(key=lambda x: x[1]["total"])
 
     def medal_for(uid: str) -> str:
-        if uid in podium.get("gold", []): return "👑 "
+        if uid in podium.get("gold", []):   return "👑 "
         if uid in podium.get("silver", []): return "🥈 "
         if uid in podium.get("bronze", []): return "🥉 "
+        if uid in podium.get("waffle", []): return "🧇 "
         return ""
 
     lines = []
@@ -245,39 +246,43 @@ async def on_message(message):
                     if t1 != t2:
                         winner_id = p1 if t1 < t2 else p2
                         scores[winner_id]["wins"] = scores[winner_id].get("wins", 0) + 1
-                    
+
                         # Build last week's podium now that duel is decided
                         ensure_meta(scores)
-                        pending = scores["_meta"].get("pending_podium")
+                        pending = scores["_meta"].get("pending_podium") or {}
+
                         gold = [winner_id]
-                        silver = []
-                        bronze = []
-                    
-                        if pending and isinstance(pending, dict):
-                            tied_first = pending.get("tied_first", [])
-                            bronze = pending.get("bronze", [])
-                            # Silver = everyone who was tied for first EXCEPT the winner
-                            silver = [uid for uid in tied_first if uid != winner_id]
-                        else:
-                            # Fallback: if no pending data (shouldn’t happen), just set gold only
-                            silver, bronze = [], []
-                    
-                        scores["_meta"]["last_podium"] = {"gold": gold, "silver": silver, "bronze": bronze}
+                        silver = [uid for uid in (pending.get("tied_first") or []) if uid != winner_id]
+                        bronze = pending.get("bronze", [])
+                        waffle = pending.get("waffle", [])  # << preserve waffle
+
+                        scores["_meta"]["last_podium"] = {
+                            "gold": gold,
+                            "silver": silver,
+                            "bronze": bronze,
+                            "waffle": waffle
+                        }
                         scores["_meta"]["duel"] = None
                         scores["_meta"]["pending_podium"] = None
-                    
+
                         save_scores(scores)
                         winner_user = await bot.fetch_user(int(winner_id))
-                        await message.channel.send(f"👑 Sudden-death duel decided! Congrats {winner_user.display_name}!")
+                        await message.channel.send(
+                            f"👑 Sudden-death duel decided! Congrats {winner_user.display_name}!"
+                        )
 
                     else:
                         next_wordle = int(wordle_number) + 1
                         scores["_meta"]["duel"]["wordle"] = next_wordle
                         save_scores(scores)
-                        await message.channel.send(f"⚔️ Duel tied again on Wordle #{wordle_number}. Carrying over to #{next_wordle}.")
+                        await message.channel.send(
+                            f"⚔️ Duel tied again on Wordle #{wordle_number}. Carrying over to #{next_wordle}."
+                        )
 
         save_scores(scores)
-        await message.channel.send(f"✅ Wordle #{wordle_number} recorded — {tries} tries for {message.author.display_name}!")
+        await message.channel.send(
+            f"✅ Wordle #{wordle_number} recorded — {tries} tries for {message.author.display_name}!"
+        )
 
         lb_text = await build_leaderboard_text()
         await message.channel.send(lb_text)
@@ -343,6 +348,11 @@ async def resetweek(ctx):
 
     def ids(block): return [uid for uid, _ in block]
 
+    # Compute last place among joined only (for waffle)
+    worst_total = max(d["total"] for _, d in entries)
+    waffle_ids = [uid for uid, d in entries if d["total"] == worst_total]
+
+    # First place / tie check
     rank1, block1 = blocks[0]
     tied_first = ids(block1)
 
@@ -351,35 +361,61 @@ async def resetweek(ctx):
         scores["_meta"]["duel"] = None
         scores["_meta"]["pending_podium"] = None
 
-        gold, silver, bronze = tied_first, [], []
-        if len(blocks) >= 2 and blocks[1][0] == 2:
-            silver = ids(blocks[1][1])
-        if len(blocks) >= 3 and blocks[2][0] == 3:
-            bronze = ids(blocks[2][1])
+        # Podium (competition ranking)
+        gold = tied_first
+        silver = ids(blocks[1][1]) if len(blocks) >= 2 and blocks[1][0] == 2 else []
+        bronze = ids(blocks[2][1]) if len(blocks) >= 3 and blocks[2][0] == 3 else []
 
-        scores["_meta"]["last_podium"] = {"gold": gold, "silver": silver, "bronze": bronze}
+        # Store last week's podium + waffle
+        last_podium = {"gold": gold, "silver": silver, "bronze": bronze, "waffle": waffle_ids}
+        scores["_meta"]["last_podium"] = last_podium
 
+        # Announce winner
         winner_id = gold[0]
         scores[winner_id]["wins"] = scores[winner_id].get("wins", 0) + 1
         winner_user = await bot.fetch_user(int(winner_id))
         await ctx.send(f"🎉 Congrats {winner_user.display_name} for winning the week with {top_total} total tries!")
+
+        # Announce last place (waffle)
+        if waffle_ids:
+            names = []
+            for uid in waffle_ids:
+                u = await bot.fetch_user(int(uid))
+                names.append(f"🧇 {u.display_name}")
+            await ctx.send("😬 Last place this week: " + ", ".join(names))
+
     else:
-        # Tie -> duel tomorrow
+        # Tie -> duel tomorrow (CST)
         tomorrow_cst = datetime.now(CENTRAL_TZ).date() + timedelta(days=1)
         duel_wordle = int(date_to_wordle(tomorrow_cst))
         scores["_meta"]["duel"] = {"players": tied_first, "wordle": duel_wordle}
 
+        # Bronze is the first block with rank >= 3 (still joined-only)
         bronze_ids = []
         for r, blk in blocks:
             if r >= 3:
                 bronze_ids = ids(blk); break
 
-        scores["_meta"]["pending_podium"] = {"tied_first": tied_first, "bronze": bronze_ids}
+        # Save pending podium (gold/silver decided later), keep waffle now
+        scores["_meta"]["pending_podium"] = {
+            "tied_first": tied_first,
+            "bronze": bronze_ids,
+            "waffle": waffle_ids
+        }
 
+        # Announce tie + duel
         names = [ (await bot.fetch_user(int(uid))).display_name for uid in tied_first ]
         await ctx.send(f"⚔️ Weekly tie! Sudden-death duel on Wordle #{duel_wordle}: {', '.join(names)}")
 
-    # --- NEW: if today is Sunday (CST), skip tonight's penalty for Sunday ---
+        # Announce last place (waffle) now (independent of duel)
+        if waffle_ids:
+            wnames = []
+            for uid in waffle_ids:
+                u = await bot.fetch_user(int(uid))
+                wnames.append(f"🧇 {u.display_name}")
+            await ctx.send("😬 Last place this week: " + ", ".join(wnames))
+
+    # --- Keep your existing Sunday-skip logic for penalties ---
     today_cst = datetime.now(CENTRAL_TZ).date()
     if today_cst.weekday() == 6:   # Monday=0 ... Sunday=6
         sunday_iso = today_cst.isoformat()
