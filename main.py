@@ -55,9 +55,6 @@ def _is_user_record(k, v):
 _DEF_META = {
     "duel": None,
     "last_podium": {"gold": [], "silver": [], "bronze": [], "waffle": []},
-    "pending_podium": None,
-    # keep your existing keys like skip_penalty_days / last_penalized_day if present
-}
     "pending_podium": None,         # used when a duel rolls into next week
     "skip_penalty_days": [],         # list of ISO dates (YYYY-MM-DD) to not penalize
     "last_penalized_day": ""         # ISO date we last processed (idempotence)
