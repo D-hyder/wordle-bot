@@ -167,38 +167,48 @@ MISSING_CHANNEL_ID = "900458273117982791"  # optional channel ID
 @tasks.loop(hours=1)
 async def nightly_missing_alert():
     now = datetime.now(CENTRAL_TZ)
-    if now.hour == 20:  # 8 PM Central
-        scores = load_scores()
-        today = now.date()
-        wordle_num = str(date_to_wordle(today))
+    if now.hour != 20:  # 8 PM Central
+        return
 
-        joined_users = {
-            uid for uid, data in scores.items()
-            if isinstance(data, dict) and data.get("joined")
-        }
-        missing_ids = [uid for uid in joined_users if wordle_num not in scores[uid]["games"]]
-        if not missing_ids:
-            return
+    scores = load_scores()
+    ensure_meta(scores)
 
-        channel = None
-        if MISSING_CHANNEL_ID and MISSING_CHANNEL_ID.isdigit():
-            channel = bot.get_channel(int(MISSING_CHANNEL_ID))
-        if channel is None:
-            channel = discord.utils.get(bot.get_all_channels(), name="general")
-        if channel is None:
-            return
+    # 🔒 If today is marked as a skip-penalty day (e.g., resetweek run on Sunday),
+    #     then don't nag people with reminders either.
+    today = now.date()
+    today_iso = today.isoformat()
+    if today_iso in scores["_meta"].get("skip_penalty_days", []):
+        return
 
-        names = []
-        for uid in missing_ids:
-            try:
-                user = await bot.fetch_user(int(uid))
-                names.append(user.display_name)
-            except Exception:
-                pass
-                
-        if names:
-            mentions = ", ".join(f"<@{uid}>" for uid in missing_ids)
-            await channel.send(f"⏰ Reminder: {mentions} still need to submit today’s Wordle!")
+    wordle_num = str(date_to_wordle(today))
+
+    joined_users = {
+        uid for uid, data in scores.items()
+        if isinstance(data, dict) and data.get("joined")
+    }
+    missing_ids = [uid for uid in joined_users if wordle_num not in scores[uid]["games"]]
+    if not missing_ids:
+        return
+
+    channel = None
+    if MISSING_CHANNEL_ID and MISSING_CHANNEL_ID.isdigit():
+        channel = bot.get_channel(int(MISSING_CHANNEL_ID))
+    if channel is None:
+        channel = discord.utils.get(bot.get_all_channels(), name="general")
+    if channel is None:
+        return
+
+    names = []
+    for uid in missing_ids:
+        try:
+            user = await bot.fetch_user(int(uid))
+            names.append(user.display_name)
+        except Exception:
+            pass
+
+    if names:
+        mentions = ", ".join(f"<@{uid}>" for uid in missing_ids)
+        await channel.send(f"⏰ Reminder: {mentions} still need to submit today’s Wordle!")
 
 # === Bot Events ===
 @bot.event
